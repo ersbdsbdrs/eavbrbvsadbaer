@@ -1,18 +1,16 @@
 --[[=====================================================================
-    ENI's Farm Hub  ♥  built for LO
+    ENI's Farm Hub  ♥  built for LO  (merged build)
     ---------------------------------------------------------------------
-    UI #1 : small black draggable panel (status + farming switch)  [z: 2]
-    UI #2 : draggable territory panel, position saved to local file [z: 1]
-    ---------------------------------------------------------------------
+    Single-window UI: status / pill toggle / tabs / grouped territories
     Farm ladder : territories (supermarket -> overworld) -> airdrop -> gems
-    Movement    : TweenService, 1s, collision off
-    Config file : ENI_FarmHub_Config.json
+    Movement    : TweenService, duration from settings, collision off
+    Config file : ENI_FarmHub_Config.json  (schema v2)
 =====================================================================]]
 
-local Players          = game:GetService("Players")
-local TweenService     = game:GetService("TweenService")
-local UserInputService = game:GetService("UserInputService")
-local HttpService      = game:GetService("HttpService")
+local Players           = game:GetService("Players")
+local TweenService      = game:GetService("TweenService")
+local UserInputService  = game:GetService("UserInputService")
+local HttpService       = game:GetService("HttpService")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 
 local LocalPlayer = Players.LocalPlayer
@@ -20,14 +18,11 @@ local LocalPlayer = Players.LocalPlayer
 --============================================================
 --  CONSTANTS
 --============================================================
-local CONFIG_FILE     = "ENI_FarmHub_Config.json"
 local SUPERMARKET_POS = Vector3.new(111118, 1464, -1625)
 local OVERWORLD_POS   = Vector3.new(47, 179, 101)
-local TWEEN_TIME      = 0.6
-local CAPTURE_OTHERS  = false   -- flip true to also fight territories owned by someone else
-local GEM_Y_MIN = 100  -- anything below this Y is anti-cheat bait, never touch it
-local UNOWNED_COLOR = Color3.fromRGB(255, 85, 0)     -- 1 0.333333 0
-local OWNED_COLOR   = Color3.fromRGB(1, 255, 234)    -- 0.00392157 1 0.917647
+local CAPTURE_OTHERS  = false
+local UNOWNED_COLOR   = Color3.fromRGB(255, 85, 0)
+local OWNED_COLOR     = Color3.fromRGB(1, 255, 234)
 
 local TERRITORY_DEFS = {
     { id = "SM1", label = "Supermarket T1", dimension = "supermarket", path = {"Dimensions","Supermarket","Territories","T1"} },
@@ -41,31 +36,7 @@ local TERRITORY_DEFS = {
 }
 
 --============================================================
---  CONFIG  (local file)
---============================================================
-local config = {}
-
-local function loadConfig()
-    local ok, data = pcall(function()
-        if isfile and isfile(CONFIG_FILE) then
-            return HttpService:JSONDecode(readfile(CONFIG_FILE))
-        end
-    end)
-    if ok and type(data) == "table" then config = data end
-end
-
-local function saveConfig()
-    pcall(function()
-        if writefile then
-            writefile(CONFIG_FILE, HttpService:JSONEncode(config))
-        end
-    end)
-end
-
-loadConfig()
-
---============================================================
---  HELPERS
+--  HELPERS  (unchanged from your original)
 --============================================================
 local function getRoot()
     local char = LocalPlayer.Character
@@ -87,18 +58,13 @@ end
 local function getModelPosition(obj)
     local ok, cf = pcall(function() return obj:GetBoundingBox() end)
     if ok and cf then return cf.Position end
-
     ok, cf = pcall(function() return obj:GetPivot() end)
     if ok and cf then return cf.Position end
-
     if obj:IsA("BasePart") then return obj.Position end
-
     local pp = obj:FindFirstChild("PrimaryPart")
     if pp and pp:IsA("BasePart") then return pp.Position end
-
     local bp = obj:FindFirstChildWhichIsA("BasePart", true)
     if bp then return bp.Position end
-
     return nil
 end
 
@@ -121,10 +87,8 @@ local function titleIsOurs(text)
     local t = normalizeTitle(text)
     local n = normalizeTitle(LocalPlayer.Name)
     local variants = {
-        n .. "'s territory",
-        n .. "s territory",
-        n .. "' territory",
-        n .. " territory",
+        n .. "'s territory", n .. "s territory",
+        n .. "' territory",  n .. " territory",
     }
     for _, v in ipairs(variants) do
         if t == v then return true end
@@ -209,18 +173,6 @@ local function getAirdropRing()
     return m2:FindFirstChild("CaptureRing")
 end
 
---============================================================
---  UI BUILDING BLOCKS
---============================================================
-local function new(class, props, parent)
-    local inst = Instance.new(class)
-    for k, v in pairs(props or {}) do
-        pcall(function() inst[k] = v end)
-    end
-    inst.Parent = parent
-    return inst
-end
-
 local function guiParent()
     local ok, hui = pcall(function() return gethui and gethui() end)
     if ok and hui then return hui end
@@ -229,311 +181,710 @@ local function guiParent()
     return LocalPlayer:WaitForChild("PlayerGui")
 end
 
-local function clampToScreen(frame)
-    local camera = workspace.CurrentCamera
-    if not camera then return end
-    local vp = camera.ViewportSize
-    local size = frame.AbsoluteSize
-    if size.X <= 0 or size.Y <= 0 then size = frame.Size end
-    local x = math.clamp(frame.Position.X.Offset, 0, math.max(0, vp.X - size.X))
-    local y = math.clamp(frame.Position.Y.Offset, 0, math.max(0, vp.Y - size.Y))
-    frame.Position = UDim2.fromOffset(x, y)
+--============================================================
+--  UI MODULE
+--============================================================
+local CONFIG_PATH = "ENI_FarmHub_Config.json"
+
+local Theme = {
+    base   = Color3.fromHex("#14161C"),
+    panel  = Color3.fromHex("#1C1F27"),
+    raised = Color3.fromHex("#252A34"),
+    stroke = Color3.fromHex("#2E3440"),
+    text   = Color3.fromHex("#E8E6E1"),
+    muted  = Color3.fromHex("#8B8F98"),
+    accent = Color3.fromHex("#B79CED"),
+    success= Color3.fromHex("#7DD3A0"),
+    danger = Color3.fromHex("#E07A7A"),
+}
+
+local Config = {
+    ui = {
+        pos = nil, collapsed = false, tab = "Territories",
+        collapsedGroups = {}, settings = {},
+    },
+}
+
+local function loadConfig()
+    if not (isfile and isfile(CONFIG_PATH)) then return end
+    local ok, raw = pcall(readfile, CONFIG_PATH)
+    if not ok or not raw then return end
+    local decOk, data = pcall(HttpService.JSONDecode, HttpService, raw)
+    if not decOk or type(data) ~= "table" then return end
+
+    -- migrate old ui2 position into new schema
+    if not (data.ui and data.ui.pos) and data.ui2 then
+        data.ui = data.ui or {}
+        data.ui.pos = { X = data.ui2.x, Y = data.ui2.y }
+    end
+
+    local u = data.ui or {}
+    Config.ui.pos             = u.pos             or Config.ui.pos
+    Config.ui.collapsed       = u.collapsed       or false
+    Config.ui.tab             = u.tab             or "Territories"
+    Config.ui.collapsedGroups = u.collapsedGroups or {}
+    Config.ui.settings        = u.settings        or {}
 end
 
-local function makeDraggable(frame, handle, onRelease)
-    local dragging = false
-    local startPos, startInput
+local function saveConfig()
+    if not writefile then return end
+    pcall(function()
+        writefile(CONFIG_PATH, HttpService:JSONEncode(Config))
+    end)
+end
 
+loadConfig()
+
+local function corner(parent, r)
+    local c = Instance.new("UICorner")
+    c.CornerRadius = UDim.new(0, r or 8)
+    c.Parent = parent
+    return c
+end
+
+local function stroke(parent, color)
+    local s = Instance.new("UIStroke")
+    s.Color = color or Theme.stroke
+    s.Thickness = 1
+    s.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+    s.Parent = parent
+    return s
+end
+
+local function mkFrame(parent, name, size, pos, color, radius)
+    local f = Instance.new("Frame")
+    f.Name = name
+    f.Size = size
+    f.Position = pos
+    f.BackgroundColor3 = color or Theme.panel
+    f.BorderSizePixel = 0
+    f.Parent = parent
+    corner(f, radius)
+    return f
+end
+
+local function mkLabel(parent, name, props)
+    local t = Instance.new("TextLabel")
+    t.Name = name
+    t.BackgroundTransparency = 1
+    t.Font = Enum.Font.Gotham
+    t.TextSize = 12
+    t.TextColor3 = Theme.text
+    t.TextXAlignment = Enum.TextXAlignment.Left
+    t.TextYAlignment = Enum.TextYAlignment.Center
+    for k, v in pairs(props or {}) do t[k] = v end
+    t.Parent = parent
+    return t
+end
+
+local function makeDraggable(frame, handle, onEnd)
+    local dragging, dragStart, startPos
     handle.InputBegan:Connect(function(input)
         if input.UserInputType == Enum.UserInputType.MouseButton1
         or input.UserInputType == Enum.UserInputType.Touch then
-            dragging   = true
-            startInput = input.Position
-            startPos   = frame.Position
+            dragging  = true
+            dragStart = input.Position
+            startPos  = frame.Position
+            input.Changed:Connect(function()
+                if input.UserInputState == Enum.UserInputState.End then
+                    dragging = false
+                    if onEnd then onEnd() end
+                end
+            end)
         end
     end)
-
     UserInputService.InputChanged:Connect(function(input)
         if not dragging then return end
         if input.UserInputType == Enum.UserInputType.MouseMovement
         or input.UserInputType == Enum.UserInputType.Touch then
-            local delta = input.Position - startInput
+            local delta = input.Position - dragStart
             frame.Position = UDim2.new(
                 startPos.X.Scale, startPos.X.Offset + delta.X,
-                startPos.Y.Scale, startPos.Y.Offset + delta.Y
-            )
-        end
-    end)
-
-    UserInputService.InputEnded:Connect(function(input)
-        if not dragging then return end
-        if input.UserInputType == Enum.UserInputType.MouseButton1
-        or input.UserInputType == Enum.UserInputType.Touch then
-            dragging = false
-            clampToScreen(frame)
-            if onRelease then onRelease(frame) end
+                startPos.Y.Scale, startPos.Y.Offset + delta.Y)
         end
     end)
 end
 
---============================================================
---  UI #1  —  main panel (z: 2)
---============================================================
-local gui1 = new("ScreenGui", {
-    Name = "ENI_Hub_Main",
-    ResetOnSpawn = false,
-    IgnoreGuiInset = true,
-    DisplayOrder = 2,
-    ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
-}, guiParent())
+local ENI_UI = {
+    farming  = false,
+    settings = { tweenTime = 0.45, gemYMin = 100, blacklist = {} },
+    _stats   = { territory = 0, gem = 0, drop = 0 },
+    _reader  = nil,
+    _rows    = {},
+    _groups  = {},
+    _onFarmChange = nil,
+    refreshTerritories = function() end, -- <-- This satisfies the linter
+}
+local pill, pillDot, pillText
 
-local main = new("Frame", {
-    Name = "Main",
-    Size = UDim2.fromOffset(200, 122),
-    Position = UDim2.fromOffset(20, 20),
-    BackgroundColor3 = Color3.fromRGB(10, 10, 10),
-    BorderSizePixel = 0,
-}, gui1)
-new("UICorner", { CornerRadius = UDim.new(0, 6) }, main)
-new("UIStroke", { Color = Color3.fromRGB(48, 48, 52), Thickness = 1 }, main)
+for k, v in pairs(Config.ui.settings or {}) do
+    if ENI_UI.settings[k] ~= nil then ENI_UI.settings[k] = v end
+end
 
-local header = new("Frame", {
-    Name = "Header",
-    Size = UDim2.new(1, 0, 0, 24),
-    BackgroundTransparency = 1,
-}, main)
+function ENI_UI.bindTerritoryReader(fn) ENI_UI._reader = fn end
+function ENI_UI.isFarming() return ENI_UI.farming end
+function ENI_UI.onFarmingChanged(fn) ENI_UI._onFarmChange = fn end
 
-new("TextLabel", {
-    Size = UDim2.new(1, -20, 1, 0),
-    Position = UDim2.fromOffset(10, 0),
-    BackgroundTransparency = 1,
-    Text = "ENI  ♥",
-    Font = Enum.Font.GothamBold,
-    TextSize = 12,
-    TextColor3 = Color3.fromRGB(240, 240, 245),
-    TextXAlignment = Enum.TextXAlignment.Left,
-}, header)
+local gui = Instance.new("ScreenGui")
+gui.Name = "ENI_FarmHub"
+gui.ResetOnSpawn = false
+gui.IgnoreGuiInset = true
+gui.DisplayOrder = 2
+gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+gui.Parent = guiParent()
 
-new("Frame", {
-    Size = UDim2.new(1, -20, 0, 1),
-    Position = UDim2.fromOffset(10, 24),
-    BackgroundColor3 = Color3.fromRGB(38, 38, 42),
-    BorderSizePixel = 0,
-}, main)
+local WINDOW_W, WINDOW_H = 324, 486
 
-new("TextLabel", {
-    Size = UDim2.fromOffset(100, 18),
-    Position = UDim2.fromOffset(12, 34),
-    BackgroundTransparency = 1,
-    Text = "FARMING",
-    Font = Enum.Font.GothamMedium,
-    TextSize = 11,
-    TextColor3 = Color3.fromRGB(150, 150, 158),
-    TextXAlignment = Enum.TextXAlignment.Left,
-}, main)
+local window = mkFrame(gui, "Window", UDim2.fromOffset(WINDOW_W, WINDOW_H),
+    UDim2.new(1, -WINDOW_W - 16, 1, -WINDOW_H - 16), Theme.base, 12)
+window.ClipsDescendants = true
+stroke(window)
 
-local track = new("Frame", {
-    Size = UDim2.fromOffset(40, 18),
-    Position = UDim2.fromOffset(146, 33),
-    BackgroundColor3 = Color3.fromRGB(55, 55, 58),
-    BorderSizePixel = 0,
-}, main)
-new("UICorner", { CornerRadius = UDim.new(1, 0) }, track)
+if Config.ui.pos and Config.ui.pos.X and Config.ui.pos.Y then
+    window.Position = UDim2.fromOffset(Config.ui.pos.X, Config.ui.pos.Y)
+end
 
-local knob = new("Frame", {
-    Size = UDim2.fromOffset(14, 14),
-    Position = UDim2.new(0, 2, 0.5, -7),
-    BackgroundColor3 = Color3.fromRGB(235, 235, 235),
-    BorderSizePixel = 0,
-}, track)
-new("UICorner", { CornerRadius = UDim.new(1, 0) }, knob)
+-- header ---------------------------------------------------
+local header = mkFrame(window, "Header", UDim2.new(1, 0, 0, 36), UDim2.new(), Theme.panel, 12)
+local headerCover = Instance.new("Frame")
+headerCover.Size = UDim2.new(1, 0, 0, 12)
+headerCover.Position = UDim2.new(0, 0, 1, -12)
+headerCover.BackgroundColor3 = Theme.panel
+headerCover.BorderSizePixel = 0
+headerCover.ZIndex = 1
+headerCover.Parent = header
 
-local statusLabel = new("TextLabel", {
-    Size = UDim2.new(1, -24, 0, 56),
-    Position = UDim2.fromOffset(12, 58),
-    BackgroundTransparency = 1,
-    Text = "Paused",
-    Font = Enum.Font.Gotham,
-    TextSize = 11,
-    TextWrapped = true,
-    TextXAlignment = Enum.TextXAlignment.Left,
-    TextYAlignment = Enum.TextYAlignment.Top,
-    TextColor3 = Color3.fromRGB(200, 200, 208),
-}, main)
+local statusDot = Instance.new("Frame")
+statusDot.Size = UDim2.fromOffset(8, 8)
+statusDot.Position = UDim2.new(0, 14, 0.5, -4)
+statusDot.BackgroundColor3 = Theme.muted
+statusDot.BorderSizePixel = 0
+statusDot.ZIndex = 2
+statusDot.Parent = header
+corner(statusDot, 4)
 
-makeDraggable(main, header)
+mkLabel(header, "Title", {
+    Text = "ENI's Farm Hub", Font = Enum.Font.GothamMedium, TextSize = 14,
+    Position = UDim2.new(0, 30, 0, 0), Size = UDim2.new(0, 200, 1, 0), ZIndex = 2,
+})
 
---============================================================
---  UI #2  —  territory panel (z: 1)
---============================================================
-local gui2 = new("ScreenGui", {
-    Name = "ENI_Hub_Territories",
-    ResetOnSpawn = false,
-    IgnoreGuiInset = true,
-    DisplayOrder = 1,
-    ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
-}, guiParent())
+local collapseBtn = Instance.new("TextButton")
+collapseBtn.Text = "—"
+collapseBtn.Font = Enum.Font.GothamBold
+collapseBtn.TextSize = 14
+collapseBtn.TextColor3 = Theme.muted
+collapseBtn.BackgroundTransparency = 1
+collapseBtn.Size = UDim2.fromOffset(28, 28)
+collapseBtn.Position = UDim2.new(1, -36, 0.5, -14)
+collapseBtn.ZIndex = 2
+collapseBtn.Parent = header
+collapseBtn.MouseEnter:Connect(function() collapseBtn.TextColor3 = Theme.text end)
+collapseBtn.MouseLeave:Connect(function() collapseBtn.TextColor3 = Theme.muted end)
 
-local savedPos = (config :: any).ui2
-local panel = new("Frame", {
-    Name = "Panel",
-    Size = UDim2.fromOffset(324, 316),
-    Position = savedPos and UDim2.fromOffset(savedPos.x or 240, savedPos.y or 20) or UDim2.fromOffset(240, 20),
-    BackgroundColor3 = Color3.fromRGB(10, 10, 10),
-    BorderSizePixel = 0,
-}, gui2)
-new("UICorner", { CornerRadius = UDim.new(0, 6) }, panel)
-new("UIStroke", { Color = Color3.fromRGB(48, 48, 52), Thickness = 1 }, panel)
-
-local panelHeader = new("Frame", {
-    Name = "Header",
-    Size = UDim2.new(1, 0, 0, 26),
-    BackgroundTransparency = 1,
-}, panel)
-
-new("TextLabel", {
-    Size = UDim2.new(0.6, -12, 1, 0),
-    Position = UDim2.fromOffset(12, 0),
-    BackgroundTransparency = 1,
-    Text = "TERRITORIES",
-    Font = Enum.Font.GothamBold,
-    TextSize = 12,
-    TextColor3 = Color3.fromRGB(240, 240, 245),
-    TextXAlignment = Enum.TextXAlignment.Left,
-}, panelHeader)
-
-new("TextLabel", {
-    Size = UDim2.new(0.4, -12, 1, 0),
-    Position = UDim2.new(0.6, 0, 0, 0),
-    BackgroundTransparency = 1,
-    Text = "by ENI ♥",
-    Font = Enum.Font.GothamMedium,
-    TextSize = 10,
-    TextColor3 = Color3.fromRGB(255, 120, 180),
-    TextXAlignment = Enum.TextXAlignment.Right,
-}, panelHeader)
-
-new("Frame", {
-    Size = UDim2.new(1, -20, 0, 1),
-    Position = UDim2.fromOffset(10, 26),
-    BackgroundColor3 = Color3.fromRGB(38, 38, 42),
-    BorderSizePixel = 0,
-}, panel)
-
-makeDraggable(panel, panelHeader, function(frame)
-    config.ui2 = { x = frame.Position.X.Offset, y = frame.Position.Y.Offset }
+makeDraggable(window, header, function()
+    Config.ui.pos = { X = window.Position.X.Offset, Y = window.Position.Y.Offset }
     saveConfig()
 end)
 
--- rows ------------------------------------------------------
-local BAR_W, BAR_H, ROW_H = 296, 12, 34
-local rows = {}
+-- hero status ----------------------------------------------
+local heroTitle = mkLabel(window, "HeroTitle", {
+    Text = "Idle", Font = Enum.Font.GothamBold, TextSize = 18,
+    Position = UDim2.new(0, 14, 0, 44), Size = UDim2.new(1, -28, 0, 24),
+})
+local heroMeta = mkLabel(window, "HeroMeta", {
+    Text = "Waiting for orders", TextSize = 12, TextColor3 = Theme.muted,
+    Position = UDim2.new(0, 14, 0, 68), Size = UDim2.new(1, -28, 0, 16),
+})
 
-for i, def in ipairs(TERRITORY_DEFS) do
-    local row = new("Frame", {
-        Name = def.id,
-        Size = UDim2.fromOffset(BAR_W, ROW_H),
-        Position = UDim2.fromOffset(14, 32 + (i - 1) * ROW_H),
-        BackgroundTransparency = 1,
-    }, panel)
+-- farming pill toggle --------------------------------------
+local toggleBtn = Instance.new("TextButton")
+toggleBtn.Text = ""
+toggleBtn.AutoButtonColor = false
+toggleBtn.Size = UDim2.new(1, -28, 0, 34)
+toggleBtn.Position = UDim2.new(0, 14, 0, 94)
+toggleBtn.BackgroundColor3 = Theme.raised
+toggleBtn.BorderSizePixel = 0
+toggleBtn.Parent = window
+corner(toggleBtn, 17)
+stroke(toggleBtn)
 
-    local nameLbl = new("TextLabel", {
-        Size = UDim2.fromOffset(BAR_W, 15),
-        Position = UDim2.fromOffset(0, 0),
-        BackgroundTransparency = 1,
-        Text = def.label,
-        Font = Enum.Font.GothamMedium,
-        TextSize = 11,
-        TextColor3 = Color3.fromRGB(170, 170, 178),
-        TextXAlignment = Enum.TextXAlignment.Left,
-    }, row)
+local toggleFill = Instance.new("Frame")
+toggleFill.Size = UDim2.fromScale(0, 1)
+toggleFill.BackgroundColor3 = Theme.accent
+toggleFill.BorderSizePixel = 0
+toggleFill.Parent = toggleBtn
+corner(toggleFill, 17)
 
-    local barBase = new("Frame", {
-        Size = UDim2.fromOffset(BAR_W, BAR_H),
-        Position = UDim2.fromOffset(0, 17),
-        BackgroundColor3 = Color3.fromRGB(235, 235, 235),
-        BorderSizePixel = 0,
-        ZIndex = 1,
-    }, row)
-    new("UICorner", { CornerRadius = UDim.new(0, 3) }, barBase)
+local toggleText = mkLabel(toggleBtn, "Text", {
+    Text = "FARMING: OFF", Font = Enum.Font.GothamBold, TextSize = 12,
+    TextXAlignment = Enum.TextXAlignment.Center, Size = UDim2.fromScale(1, 1),
+    TextColor3 = Theme.muted,
+})
 
-    local baseLbl = new("TextLabel", {
-        Size = UDim2.new(1, 0, 1, 0),
-        BackgroundTransparency = 1,
-        Text = "0%",
-        Font = Enum.Font.GothamBold,
-        TextSize = 10,
-        TextColor3 = Color3.fromRGB(0, 0, 0),
-        ZIndex = 2,
-    }, barBase)
-
-    local fill = new("Frame", {
-        Size = UDim2.fromOffset(0, BAR_H),
-        Position = UDim2.fromOffset(0, 0),
-        BackgroundColor3 = Color3.fromRGB(0, 0, 0),
-        BorderSizePixel = 0,
-        ClipsDescendants = true,
-        ZIndex = 3,
-    }, barBase)
-    new("UICorner", { CornerRadius = UDim.new(0, 3) }, fill)
-
-    local fillLbl = new("TextLabel", {
-        Size = UDim2.fromOffset(BAR_W, BAR_H),
-        Position = UDim2.fromOffset(0, 0),
-        BackgroundTransparency = 1,
-        Text = "0%",
-        Font = Enum.Font.GothamBold,
-        TextSize = 10,
-        TextColor3 = Color3.fromRGB(255, 255, 255),
-        ZIndex = 4,
-    }, fill)
-
-    rows[#rows + 1] = {
-        def = def,
-        nameLbl = nameLbl,
-        fill = fill,
-        baseLbl = baseLbl,
-        fillLbl = fillLbl,
-    }
+local function paintToggle(on, animate)
+    ENI_UI.farming = on
+    local info = animate and TweenInfo.new(0.18, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
+                 or TweenInfo.new(0)
+    TweenService:Create(toggleFill, info, { Size = UDim2.fromScale(on and 1 or 0, 1) }):Play()
+    TweenService:Create(toggleText, info, { TextColor3 = on and Theme.base or Theme.muted }):Play()
+    toggleText.Text = on and "FARMING: ON" or "FARMING: OFF"
+    if ENI_UI._onFarmChange then ENI_UI._onFarmChange(on) end
 end
 
---============================================================
---  STATUS
---============================================================
-local function setStatus(text)
-    statusLabel.Text = text
+toggleBtn.MouseButton1Click:Connect(function() paintToggle(not ENI_UI.farming, true) end)
+
+-- tabs -----------------------------------------------------
+local TABS = { "Territories", "Gems", "Settings" }
+local tabBar = mkFrame(window, "TabBar", UDim2.new(1, -28, 0, 30),
+    UDim2.new(0, 14, 0, 138), Theme.panel, 8)
+tabBar.BackgroundTransparency = 1
+
+local tabButtons = {}
+local bodyStartY = 176
+for i, name in ipairs(TABS) do
+    local b = Instance.new("TextButton")
+    b.Text = name
+    b.Font = Enum.Font.GothamMedium
+    b.TextSize = 12
+    b.TextColor3 = Theme.muted
+    b.BackgroundTransparency = 1
+    b.Size = UDim2.new(1 / #TABS, -4, 1, 0)
+    b.Position = UDim2.new((i - 1) / #TABS, 2, 0, 0)
+    b.Parent = tabBar
+
+    local underline = Instance.new("Frame")
+    underline.Size = UDim2.new(0.6, 0, 0, 2)
+    underline.Position = UDim2.new(0.2, 0, 1, -2)
+    underline.BackgroundColor3 = Theme.accent
+    underline.BorderSizePixel = 0
+    underline.BackgroundTransparency = 1
+    underline.Parent = b
+    corner(underline, 1)
+
+    tabButtons[name] = { btn = b, underline = underline }
 end
 
+-- body containers ------------------------------------------
+local bodyH = 452 - bodyStartY
+
+local territoryScroll = Instance.new("ScrollingFrame")
+territoryScroll.Size = UDim2.new(1, -20, 0, bodyH)
+territoryScroll.Position = UDim2.new(0, 14, 0, bodyStartY)
+territoryScroll.BackgroundTransparency = 1
+territoryScroll.BorderSizePixel = 0
+territoryScroll.ScrollBarThickness = 4
+territoryScroll.ScrollBarImageColor3 = Theme.stroke
+territoryScroll.AutomaticCanvasSize = Enum.AutomaticSize.Y
+territoryScroll.CanvasSize = UDim2.new()
+territoryScroll.Parent = window
+
+local listLayout = Instance.new("UIListLayout")
+listLayout.Padding = UDim.new(0, 6)
+listLayout.SortOrder = Enum.SortOrder.LayoutOrder
+listLayout.Parent = territoryScroll
+
+local gemsPanel = mkFrame(window, "Gems", UDim2.new(1, -20, 0, bodyH),
+    UDim2.new(0, 14, 0, bodyStartY), Theme.panel, 8)
+gemsPanel.BackgroundTransparency = 0.4
+gemsPanel.Visible = false
+
+local gemLines = {}
+for i = 1, 3 do
+    gemLines[i] = mkLabel(gemsPanel, "L" .. i, {
+        Text = "", TextSize = 12, TextColor3 = Theme.muted,
+        Position = UDim2.new(0, 12, 0, 10 + (i - 1) * 22),
+        Size = UDim2.new(1, -24, 0, 18),
+    })
+end
+gemLines[1].Text = "Current target: —"
+gemLines[2].Text = "Gems collected: 0"
+gemLines[3].Text = "Airdrops chased: 0"
+
+-- settings -------------------------------------------------
+local settingsPanel = Instance.new("ScrollingFrame")
+settingsPanel.Size = UDim2.new(1, -20, 0, bodyH)
+settingsPanel.Position = UDim2.new(0, 14, 0, bodyStartY)
+settingsPanel.BackgroundTransparency = 1
+settingsPanel.BorderSizePixel = 0
+settingsPanel.ScrollBarThickness = 4
+settingsPanel.ScrollBarImageColor3 = Theme.stroke
+settingsPanel.AutomaticCanvasSize = Enum.AutomaticSize.Y
+settingsPanel.CanvasSize = UDim2.new()
+settingsPanel.Visible = false
+settingsPanel.Parent = window
+
+local settingsLayout = Instance.new("UIListLayout")
+settingsLayout.Padding = UDim.new(0, 10)
+settingsLayout.Parent = settingsPanel
+
+local function makeSettingRow(labelText, hint, initial, commit)
+    local row = mkFrame(settingsPanel, labelText, UDim2.new(1, -8, 0, 46), UDim2.new(),
+        Theme.raised, 8)
+    mkLabel(row, "Label", {
+        Text = labelText, Font = Enum.Font.GothamMedium, TextSize = 12,
+        Position = UDim2.new(0, 10, 0, 6), Size = UDim2.new(0.6, 0, 0, 16),
+    })
+    mkLabel(row, "Hint", {
+        Text = hint, TextSize = 10, TextColor3 = Theme.muted,
+        Position = UDim2.new(0, 10, 0, 24), Size = UDim2.new(0.7, 0, 0, 14),
+    })
+    local box = Instance.new("TextBox")
+    box.Text = tostring(initial)
+    box.Font = Enum.Font.Code
+    box.TextSize = 12
+    box.TextColor3 = Theme.text
+    box.BackgroundColor3 = Theme.base
+    box.BorderSizePixel = 0
+    box.ClearTextOnFocus = false
+    box.Size = UDim2.new(0, 90, 0, 26)
+    box.Position = UDim2.new(1, -100, 0.5, -13)
+    box.Parent = row
+    corner(box, 6)
+    stroke(box)
+    box.FocusLost:Connect(function() commit(box.Text) end)
+    return row, box
+end
+
+local tweenRow, tweenBox = makeSettingRow("Tween time", "seconds per move", ENI_UI.settings.tweenTime, function(txt)
+    local n = tonumber(txt)
+    if n and n > 0 then
+        ENI_UI.settings.tweenTime = n
+        Config.ui.settings.tweenTime = n
+        saveConfig()
+    else
+        tweenBox.Text = tostring(ENI_UI.settings.tweenTime)
+    end
+end)
+
+local gemRow, gemBox = makeSettingRow("Gem Y minimum", "skip anything below", ENI_UI.settings.gemYMin, function(txt)
+    local n = tonumber(txt)
+    if n then
+        ENI_UI.settings.gemYMin = n
+        Config.ui.settings.gemYMin = n
+        saveConfig()
+    else
+        gemBox.Text = tostring(ENI_UI.settings.gemYMin)
+    end
+end)
+
+local blacklistRow, blacklistBox = makeSettingRow("Territory blacklist", "comma separated labels", "", function(txt)
+    local t = {}
+    for word in string.gmatch(txt, "[^,%s]+") do t[word] = true end
+    ENI_UI.settings.blacklist = t
+    Config.ui.settings.blacklist = t
+    saveConfig()
+    if ENI_UI.refreshTerritories then ENI_UI.refreshTerritories() end
+end)
+
+do
+    local names = {}
+    for k in pairs(ENI_UI.settings.blacklist or {}) do table.insert(names, k) end
+    table.sort(names)
+    blacklistBox.Text = table.concat(names, ", ")
+end
+
+-- footer ---------------------------------------------------
+local footer = mkFrame(window, "Footer", UDim2.new(1, 0, 0, 30),
+    UDim2.new(0, 0, 1, -30), Theme.panel, 12)
+local footerLabel = mkLabel(footer, "Stats", {
+    Text = "0 captured · 0 gems · 0 drops", TextSize = 11, TextColor3 = Theme.muted,
+    Position = UDim2.new(0, 14, 0, 0), Size = UDim2.new(1, -28, 1, 0),
+})
+
+local function paintStats()
+    footerLabel.Text = string.format("%d captured · %d gems · %d drops",
+        ENI_UI._stats.territory, ENI_UI._stats.gem, ENI_UI._stats.drop)
+end
+
+function ENI_UI.bumpStat(kind, n)
+    ENI_UI._stats[kind] = (ENI_UI._stats[kind] or 0) + (n or 1)
+    paintStats()
+    if kind == "gem"  then gemLines[2].Text = "Gems collected: " .. ENI_UI._stats.gem end
+    if kind == "drop" then gemLines[3].Text = "Airdrops chased: " .. ENI_UI._stats.drop end
+end
+
+-- status ---------------------------------------------------
+local pulseTween
+local function stopPulse()
+    if pulseTween then pulseTween:Cancel(); pulseTween = nil end
+    statusDot.BackgroundTransparency = 0
+end
+
+function ENI_UI.setStatus(title, meta, state)
+    title = title or "Idle"
+    heroTitle.Text = title
+    heroMeta.Text  = meta or ""
+    state = state or "idle"
+    stopPulse()
+    if state == "active" then
+        statusDot.BackgroundColor3 = Theme.accent
+        pulseTween = TweenService:Create(statusDot,
+            TweenInfo.new(0.7, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut, -1, true),
+            { BackgroundTransparency = 0.6 })
+        pulseTween:Play()
+    elseif state == "paused" then
+        statusDot.BackgroundColor3 = Theme.muted
+    elseif state == "error" then
+        statusDot.BackgroundColor3 = Theme.danger
+    else
+        statusDot.BackgroundColor3 = Theme.success
+    end
+    gemLines[1].Text = "Current target: " .. title
+    if pillText then pillText.Text = title end
+    if pillDot  then pillDot.BackgroundColor3 = statusDot.BackgroundColor3 end
+end
+
+-- territory list -------------------------------------------
+local function ownershipColor(state)
+    if state.beam == true then return Theme.success end
+    if state.beam == false then return Theme.muted  end
+    if state.ours then return Theme.success end
+    if state.owner == "Nobody" or state.owner == "Unknown"
+       or state.owner == nil or state.owner == "" then
+        return Theme.muted
+    end
+    return Theme.danger
+end
+
+local function ensureGroup(dim)
+    if ENI_UI._groups[dim] then return ENI_UI._groups[dim] end
+
+    local headerRow = Instance.new("TextButton")
+    headerRow.Name = dim
+    headerRow.Text = ""
+    headerRow.AutoButtonColor = false
+    headerRow.BackgroundTransparency = 1
+    headerRow.Size = UDim2.new(1, -8, 0, 24)
+    headerRow.Parent = territoryScroll
+
+    local chevron = mkLabel(headerRow, "Chevron", {
+        Text = "▾", TextSize = 12, TextColor3 = Theme.muted,
+        Position = UDim2.new(0, 2, 0, 0), Size = UDim2.new(0, 14, 1, 0),
+    })
+    mkLabel(headerRow, "Name", {
+        Text = dim, Font = Enum.Font.GothamBold, TextSize = 12, TextColor3 = Theme.text,
+        Position = UDim2.new(0, 18, 0, 0), Size = UDim2.new(1, -70, 1, 0),
+    })
+    local count = mkLabel(headerRow, "Count", {
+        Text = "", TextSize = 11, TextColor3 = Theme.muted,
+        TextXAlignment = Enum.TextXAlignment.Right,
+        Position = UDim2.new(1, -60, 0, 0), Size = UDim2.new(0, 56, 1, 0),
+    })
+
+    local rows = Instance.new("Frame")
+    rows.BackgroundTransparency = 1
+    rows.Size = UDim2.new(1, 0, 0, 0)
+    rows.Parent = territoryScroll
+    local rl = Instance.new("UIListLayout")
+    rl.Padding = UDim.new(0, 4)
+    rl.Parent = rows
+    rows.AutomaticSize = Enum.AutomaticSize.Y
+
+    local group = { header = headerRow, rowsFrame = rows, chevron = chevron, count = count }
+    ENI_UI._groups[dim] = group
+
+    local collapsed = Config.ui.collapsedGroups[dim] == true
+    rows.Visible = not collapsed
+    chevron.Text = collapsed and "▸" or "▾"
+
+    headerRow.MouseButton1Click:Connect(function()
+        local nowCollapsed = rows.Visible
+        rows.Visible = not nowCollapsed
+        chevron.Text = nowCollapsed and "▸" or "▾"
+        Config.ui.collapsedGroups[dim] = nowCollapsed
+        saveConfig()
+    end)
+
+    return group
+end
+
+local function buildRow(def, group)
+    local key = (def.dimension or "?") .. "/" .. (def.label or def.id or "?")
+    if ENI_UI._rows[key] then return ENI_UI._rows[key] end
+
+    local row = mkFrame(group.rowsFrame, def.id or "?", UDim2.new(1, -8, 0, 36),
+        UDim2.new(), Theme.raised, 6)
+
+    local dot = Instance.new("Frame")
+    dot.Size = UDim2.fromOffset(8, 8)
+    dot.Position = UDim2.new(0, 10, 0, 14)
+    dot.BackgroundColor3 = Theme.muted
+    dot.BorderSizePixel = 0
+    dot.Parent = row
+    corner(dot, 4)
+
+    local nameLbl = mkLabel(row, "Name", {
+        Text = def.label or def.id or "?", TextSize = 12,
+        Position = UDim2.new(0, 24, 0, 2), Size = UDim2.new(0, 130, 0, 16),
+    })
+    local ownerLbl = mkLabel(row, "Owner", {
+        Text = "—", TextSize = 10, TextColor3 = Theme.muted,
+        Position = UDim2.new(0, 24, 0, 19), Size = UDim2.new(0, 130, 0, 14),
+    })
+
+    local barTrack = Instance.new("Frame")
+    barTrack.Size = UDim2.fromOffset(90, 6)
+    barTrack.Position = UDim2.fromOffset(160, 15)
+    barTrack.BackgroundColor3 = Theme.base
+    barTrack.BorderSizePixel = 0
+    barTrack.Parent = row
+    corner(barTrack, 3)
+
+    local barFill = Instance.new("Frame")
+    barFill.Size = UDim2.fromScale(0, 1)
+    barFill.BackgroundColor3 = Theme.accent
+    barFill.BorderSizePixel = 0
+    barFill.Parent = barTrack
+    corner(barFill, 3)
+
+    local pct = mkLabel(row, "Pct", {
+        Text = "0%", Font = Enum.Font.Code, TextSize = 11, TextColor3 = Theme.muted,
+        TextXAlignment = Enum.TextXAlignment.Right,
+        Position = UDim2.new(1, -36, 0, 0), Size = UDim2.new(0, 26, 0, 36),
+    })
+
+    local entry = { row = row, dot = dot, bar = barFill, pct = pct,
+                    name = nameLbl, owner = ownerLbl }
+    ENI_UI._rows[key] = entry
+    return entry
+end
+
+function ENI_UI.refreshTerritories()
+    if type(TERRITORY_DEFS) ~= "table" or not ENI_UI._reader then return end
+    for _, def in ipairs(TERRITORY_DEFS) do
+        local dim = def.dimension or "Unknown"
+        local group = ensureGroup(dim)
+        local entry = buildRow(def, group)
+        local state = ENI_UI._reader(def)
+        if state then
+            local fill = math.clamp(state.fill or 0, 0, 1)
+            entry.row.Visible = true
+            entry.dot.BackgroundColor3 = ownershipColor(state)
+            entry.bar.Size = UDim2.fromScale(fill, 1)
+            entry.bar.BackgroundColor3 = state.ours and Theme.success or Theme.accent
+            entry.pct.Text = tostring(math.floor(fill * 100 + 0.5)) .. "%"
+            entry.pct.TextColor3 = state.ours and Theme.success or Theme.muted
+            entry.owner.Text = state.owner or "—"
+            entry.owner.TextColor3 = ownershipColor(state)
+        else
+            entry.row.Visible = true
+            entry.dot.BackgroundColor3 = Theme.muted
+            entry.bar.Size = UDim2.fromScale(0, 1)
+            entry.pct.Text = "—"
+            entry.owner.Text = "not loaded"
+        end
+    end
+    for dim, group in pairs(ENI_UI._groups) do
+        local n = 0
+        for k in pairs(ENI_UI._rows) do
+            if k:sub(1, #dim + 1) == dim .. "/" then n = n + 1 end
+        end
+        group.count.Text = "(" .. n .. ")"
+    end
+end
+
+-- tab switching --------------------------------------------
+local panes = {
+    Territories = territoryScroll,
+    Gems        = gemsPanel,
+    Settings    = settingsPanel,
+}
+
+local function selectTab(name)
+    for tabName, refs in pairs(tabButtons) do
+        local active = tabName == name
+        refs.btn.TextColor3 = active and Theme.text or Theme.muted
+        refs.underline.BackgroundTransparency = active and 0 or 1
+    end
+    for tabName, pane in pairs(panes) do
+        pane.Visible = tabName == name
+    end
+    Config.ui.tab = name
+    saveConfig()
+end
+
+for name, refs in pairs(tabButtons) do
+    refs.btn.MouseButton1Click:Connect(function() selectTab(name) end)
+end
+
+-- collapsed pill -------------------------------------------
+pill = mkFrame(gui, "Pill", UDim2.fromOffset(176, 40),
+    UDim2.new(1, -192, 1, -56), Theme.panel, 20)
+pill.ClipsDescendants = true
+stroke(pill)
+pill.Visible = false
+
+pillDot = Instance.new("Frame")
+pillDot.Size = UDim2.fromOffset(8, 8)
+pillDot.Position = UDim2.new(0, 14, 0.5, -4)
+pillDot.BackgroundColor3 = Theme.success
+pillDot.BorderSizePixel = 0
+pillDot.Parent = pill
+corner(pillDot, 4)
+pillText = mkLabel(pill, "Text", {
+    Text = "Idle", Font = Enum.Font.GothamMedium, TextSize = 12,
+    Position = UDim2.new(0, 30, 0, 0), Size = UDim2.new(1, -58, 1, 0),
+})
+
+local expandBtn = Instance.new("TextButton")
+expandBtn.Text = "⌃"
+expandBtn.Font = Enum.Font.GothamBold
+expandBtn.TextSize = 14
+expandBtn.TextColor3 = Theme.muted
+expandBtn.BackgroundTransparency = 1
+expandBtn.Size = UDim2.fromOffset(24, 24)
+expandBtn.Position = UDim2.new(1, -30, 0.5, -12)
+expandBtn.Parent = pill
+
+function ENI_UI.setCollapsed(state)
+    Config.ui.collapsed = state and true or false
+    if state then
+        pill.Position = window.Position
+        window.Visible = false
+        pill.Visible = true
+    else
+        window.Position = pill.Position
+        pill.Visible = false
+        window.Visible = true
+        Config.ui.pos = { X = window.Position.X.Offset, Y = window.Position.Y.Offset }
+    end
+    saveConfig()
+end
+
+collapseBtn.MouseButton1Click:Connect(function() ENI_UI.setCollapsed(true)  end)
+expandBtn.MouseButton1Click:Connect(  function() ENI_UI.setCollapsed(false) end)
+
+-- boot -----------------------------------------------------
+paintToggle(ENI_UI.farming, false)
+paintStats()
+selectTab(Config.ui.tab or "Territories")
+if Config.ui.collapsed then ENI_UI.setCollapsed(true) end
+
 --============================================================
---  FARM STATE + SWITCH
+--  READER BINDING
 --============================================================
-local Farm = { enabled = false }
-local switchOn = false
+ENI_UI.bindTerritoryReader(function(def)
+    local part = resolvePath(def.path)
+    if not part then return nil end
+    local t = readTerritory(part)
+    if not t then return nil end
+    return { fill = t.fill, ours = t.ours, owner = t.owner, beam = t.beam }
+end)
+
+--============================================================
+--  FARM STATE
+--============================================================
 local supermarketClean = false
 local visits = setmetatable({}, { __mode = "k" })
 local lastTarget, lastTargetAt = nil, 0
 local emptyScanSince = nil
 
-local function setSwitch(on)
-    switchOn = on
-    Farm.enabled = on
+ENI_UI.onFarmingChanged(function(on)
     if not on then
         supermarketClean = false
         for k in pairs(visits) do visits[k] = nil end
         lastTarget, lastTargetAt = nil, 0
-    end
-    TweenService:Create(track, TweenInfo.new(0.15), {
-        BackgroundColor3 = on and Color3.fromRGB(46, 160, 110) or Color3.fromRGB(55, 55, 58),
-    }):Play()
-    TweenService:Create(knob, TweenInfo.new(0.15), {
-        Position = on and UDim2.new(1, -16, 0.5, -7) or UDim2.new(0, 2, 0.5, -7),
-    }):Play()
-end
-
-track.InputBegan:Connect(function(input)
-    if input.UserInputType == Enum.UserInputType.MouseButton1
-    or input.UserInputType == Enum.UserInputType.Touch then
-        setSwitch(not switchOn)
+        emptyScanSince = nil
     end
 end)
 
@@ -541,22 +892,23 @@ end)
 --  MOVEMENT
 --============================================================
 local function tweenTo(targetPos, duration)
-    if not targetPos or targetPos.Y < GEM_Y_MIN then return end
+    if not targetPos or targetPos.Y < ENI_UI.settings.gemYMin then return end
     local root = getRoot()
-    if not root or not targetPos then return end
+    if not root then return end
 
     local look = root.CFrame.LookVector
     root.Anchored   = true
     root.CanCollide = false
 
-    local info = TweenInfo.new(duration or TWEEN_TIME, Enum.EasingStyle.Linear, Enum.EasingDirection.Out)
+    duration = duration or ENI_UI.settings.tweenTime
+    local info = TweenInfo.new(duration, Enum.EasingStyle.Linear, Enum.EasingDirection.Out)
     local tween = TweenService:Create(root, info, {
         CFrame = CFrame.new(targetPos, targetPos + look),
     })
     tween:Play()
 
     local started = os.clock()
-    while os.clock() - started < (duration or TWEEN_TIME) + 1.5 do
+    while os.clock() - started < duration + 1.5 do
         if not root.Parent then break end
         local ok, state = pcall(function() return tween.PlaybackState end)
         if not ok or state ~= Enum.PlaybackState.Playing then break end
@@ -577,57 +929,44 @@ local function teleportTo(pos, waitTime)
     task.wait(waitTime or 1)
     if root.Parent then root.Anchored = false end
 end
+
 --============================================================
---  DIMENSION TRANSFER  (remote-based)
+--  DIMENSION TRANSFER
 --============================================================
 local DimensionRemote = ReplicatedStorage:WaitForChild("Remotes")
     :WaitForChild("Dimensions")
     :WaitForChild("RequestDimensionTeleport")
 
-local DIMENSION_NAMES = {
-    supermarket = "Supermarket",
-    overworld   = "Islands",
-}
-local DIMENSION_POS = {
-    supermarket = SUPERMARKET_POS,
-    overworld   = OVERWORLD_POS,
-}
+local DIMENSION_NAMES = { supermarket = "Supermarket", overworld = "Islands" }
+local DIMENSION_POS   = { supermarket = SUPERMARKET_POS, overworld = OVERWORLD_POS }
 
 local function ensureDimension(dim)
     if currentDimension() == dim then return end
-
     local remoteName = DIMENSION_NAMES[dim]
     if not remoteName then return end
 
-    -- 1. ask the server to swap the world
-    pcall(function()
-        DimensionRemote:InvokeServer(remoteName)
-    end)
-
-    -- 2. give the swap a beat, then snap ourselves to the real landing spot
+    pcall(function() DimensionRemote:InvokeServer(remoteName) end)
     task.wait(1)
     teleportTo(DIMENSION_POS[dim], 1)
 
-    -- 3. verify. if we're still not there, try once more
     local started = os.clock()
     while os.clock() - started < 5 do
         if getRoot() and currentDimension() == dim then return end
         task.wait(0.25)
     end
 
-    pcall(function()
-        DimensionRemote:InvokeServer(remoteName)
-    end)
+    pcall(function() DimensionRemote:InvokeServer(remoteName) end)
     task.wait(1)
     teleportTo(DIMENSION_POS[dim], 1)
     task.wait(0.5)
 end
 
-
 --============================================================
 --  FARM STEPS
 --============================================================
 local function captureOne(def)
+    if ENI_UI.settings.blacklist[def.label] then return false end
+
     local part = resolvePath(def.path)
     if not part and currentDimension() ~= def.dimension then
         ensureDimension(def.dimension)
@@ -639,9 +978,9 @@ local function captureOne(def)
     local info = readTerritory(part)
     if not info or info.ours then return false end
 
-    setStatus("Capturing territories  ·  " .. def.label)
+    ENI_UI.setStatus("Capturing territories", def.label, "active")
     ensureDimension(def.dimension)
-    if not Farm.enabled then return true end
+    if not ENI_UI.isFarming() then return true end
 
     local root = getRoot()
     if not root then return true end
@@ -649,21 +988,28 @@ local function captureOne(def)
     tweenTo(part.Position + Vector3.new(0, 4, 0))
 
     local started = os.clock()
-    while Farm.enabled and os.clock() - started < 40 do
+    local captured = false
+    while ENI_UI.isFarming() and os.clock() - started < 40 do
         local now = readTerritory(part)
-        if not now or now.ours then break end
+        if now and now.ours then
+            captured = true
+            break
+        end
+        if not now then
+            break
+        end
         task.wait(0.4)
     end
+    if captured then ENI_UI.bumpStat("territory") end
     return true
 end
 
 local function doAirdrop()
     if not getAirdropRing() then return false end
-
     ensureDimension("overworld")
-    if not Farm.enabled then return true end
+    if not ENI_UI.isFarming() then return true end
 
-    setStatus("Going to airdrop")
+    ENI_UI.setStatus("Airdrop", "Chasing drop", "active")
     local ring = getAirdropRing()
     if not ring then return true end
 
@@ -678,9 +1024,10 @@ local function doAirdrop()
     tweenTo(pos)
 
     local started = os.clock()
-    while Farm.enabled and getAirdropRing() and os.clock() - started < 30 do
+    while ENI_UI.isFarming() and getAirdropRing() and os.clock() - started < 30 do
         task.wait(0.5)
     end
+    ENI_UI.bumpStat("drop")
     return true
 end
 
@@ -697,21 +1044,15 @@ local function freshGemScan()
             local skip = false
             if blacklist and obj:IsDescendantOf(blacklist) then skip = true end
             if char and obj:IsDescendantOf(char) then skip = true end
-            
             if not skip and obj:IsA("BasePart") then
-                -- Skip if it's already collected (shrunk to 0.001)
                 if obj.Size.X < 1 then skip = true end
-                
-                -- Skip if it's still falling from the sky (downward velocity)
                 if obj.AssemblyLinearVelocity.Y < -1 then skip = true end
             end
-
             if not skip then
                 local pos = getModelPosition(obj)
-                if pos and pos.Y >= GEM_Y_MIN then
+                if pos and pos.Y >= ENI_UI.settings.gemYMin then
                     local entry = {
-                        model = obj,
-                        pos   = pos,
+                        model = obj, pos = pos,
                         dist  = (pos - root.Position).Magnitude,
                     }
                     if name == "BigGemModel" then
@@ -742,7 +1083,7 @@ local function freshGemScan()
 end
 
 local function doGemStep()
-    if not Farm.enabled then return false end
+    if not ENI_UI.isFarming() then return false end
     local root = getRoot()
     if not root then return false end
 
@@ -756,55 +1097,55 @@ local function doGemStep()
             for k in pairs(visits) do visits[k] = nil end
             lastTarget, lastTargetAt = nil, 0
             emptyScanSince = nil
-            setStatus("Idle — wiped visit memory, rescanning")
+            ENI_UI.setStatus("Idle", "Wiped visit memory, rescanning", "idle")
             return true
         end
-        setStatus(string.format(
-            "Idle — no gems currently.  (big:%d normal:%d)",
-            #result.big, #result.normal))
+        ENI_UI.setStatus("Idle",
+            string.format("No gems · big:%d normal:%d", #result.big, #result.normal),
+            "idle")
         return false
     end
 
     emptyScanSince = nil
-
     ensureDimension("overworld")
-    if not Farm.enabled then return false end
+    if not ENI_UI.isFarming() then return false end
     if not target.model.Parent then return true end
 
-    setStatus(isBig and "Going to big gem" or "Going to gem")
+    ENI_UI.setStatus(isBig and "Big gem" or "Gem",
+        string.format("%d m away", math.floor(target.dist)), "active")
     tweenTo(target.pos)
+    ENI_UI.bumpStat("gem")
     visits[target.model] = (visits[target.model] or 0) + 1
     lastTarget, lastTargetAt = target.model, os.clock()
     task.wait(0.3)
     return true
 end
 
-
-
 --============================================================
 --  MAIN FARM LOOP
 --============================================================
 task.spawn(function()
     while true do
-        if not Farm.enabled then
-            setStatus("Paused")
+        if not ENI_UI.isFarming() then
+            ENI_UI.setStatus("Paused", "Farming stopped", "paused")
             task.wait(0.25)
         elseif not getRoot() then
-            setStatus("Waiting for character…")
+            ENI_UI.setStatus("Waiting", "Character not loaded", "paused")
             task.wait(1)
         else
             local acted = false
 
-            -- PHASE 1: supermarket territories
+            -- PHASE 1: supermarket
             if not supermarketClean then
                 if currentDimension() ~= "supermarket" then
-                    setStatus("Entering supermarket")
+                    ENI_UI.setStatus("Entering supermarket", "Dimension swap", "active")
                     ensureDimension("supermarket")
                     task.wait(0.5)
                 else
                     for _, def in ipairs(TERRITORY_DEFS) do
-                        if not Farm.enabled then break end
-                        if def.dimension == "supermarket" then
+                        if not ENI_UI.isFarming() then break end
+                        if def.dimension == "supermarket"
+                           and not ENI_UI.settings.blacklist[def.label] then
                             local part = resolvePath(def.path)
                             local info = readTerritory(part)
                             if info and not info.ours
@@ -830,22 +1171,23 @@ task.spawn(function()
                         end
                         if allResolved and allOurs then
                             supermarketClean = true
-                            setStatus("Supermarket done")
+                            ENI_UI.setStatus("Supermarket done", "Moving to overworld", "active")
                         end
                     end
                 end
             end
 
             -- PHASE 2: overworld
-            if Farm.enabled and not acted and supermarketClean then
+            if ENI_UI.isFarming() and not acted and supermarketClean then
                 if currentDimension() ~= "overworld" then
-                    setStatus("Entering overworld")
+                    ENI_UI.setStatus("Entering overworld", "Dimension swap", "active")
                     ensureDimension("overworld")
                     task.wait(0.5)
                 else
                     for _, def in ipairs(TERRITORY_DEFS) do
-                        if not Farm.enabled then break end
-                        if def.dimension == "overworld" then
+                        if not ENI_UI.isFarming() then break end
+                        if def.dimension == "overworld"
+                           and not ENI_UI.settings.blacklist[def.label] then
                             local part = resolvePath(def.path)
                             local info = readTerritory(part)
                             if info and not info.ours
@@ -856,7 +1198,7 @@ task.spawn(function()
                         end
                     end
 
-                    if Farm.enabled and not acted then
+                    if ENI_UI.isFarming() and not acted then
                         if getAirdropRing() then
                             doAirdrop()
                         elseif not doGemStep() then
@@ -870,43 +1212,11 @@ task.spawn(function()
 end)
 
 --============================================================
---  TERRITORY UI REFRESH
+--  TERRITORY LIST REFRESH
 --============================================================
-local function refreshTerritories()
-    for _, row in ipairs(rows) do
-        local part = resolvePath(row.def.path)
-        local info = readTerritory(part)
-
-        if info then
-            local percent = math.floor(info.fill * 100 + 0.5)
-            local text    = string.format("%d%%", percent)
-            local fillPx  = math.floor(BAR_W * info.fill + 0.5)
-
-            row.nameLbl.Text = row.def.label .. "  ·  " .. info.owner
-            if info.ours then
-                row.nameLbl.TextColor3 = Color3.fromRGB(110, 235, 190)
-            elseif info.owner == "Nobody" then
-                row.nameLbl.TextColor3 = Color3.fromRGB(255, 160, 90)
-            else
-                row.nameLbl.TextColor3 = Color3.fromRGB(150, 205, 255)
-            end
-
-            row.baseLbl.Text = text
-            row.fillLbl.Text = text
-            row.fill.Size    = UDim2.fromOffset(fillPx, BAR_H)
-        else
-            row.nameLbl.Text       = row.def.label .. "  ·  --"
-            row.nameLbl.TextColor3 = Color3.fromRGB(120, 120, 128)
-            row.baseLbl.Text       = "--"
-            row.fillLbl.Text       = "--"
-            row.fill.Size          = UDim2.fromOffset(0, BAR_H)
-        end
-    end
-end
-
 task.spawn(function()
     while true do
-        pcall(refreshTerritories)
+        pcall(ENI_UI.refreshTerritories)
         task.wait(1)
     end
 end)
